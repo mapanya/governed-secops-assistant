@@ -1,0 +1,17 @@
+# Secrets: never upload keys
+.env
+
+# Python working files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Editor and system files
+.vscode/
+.idea/
+.DS_Store
+
+# Local logs
+*.log

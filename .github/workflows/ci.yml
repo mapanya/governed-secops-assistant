@@ -1,0 +1,86 @@
+# Runs on every push and pull request. Two jobs:
+#   1. unit-tests  : the fast tests, no Docker or key needed.
+#   2. full-stack  : builds both images, starts the whole platform with Docker
+#                    Compose, runs the end-to-end check, keeps its report and
+#                    lists known vulnerabilities in the built images (Trivy,
+#                    report only, shown in the run summary).
+#
+# The pipeline holds no secrets at all: the full-stack job creates throwaway
+# keys and runs without a Gemini key (quoted-passage answers). So a
+# compromised tool in the pipeline would find nothing here to steal.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install test packages
+        run: pip install -r requirements-dev.txt
+      - name: Run unit tests
+        run: python -m pytest -v
+
+  full-stack:
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Create throwaway settings
+        run: |
+          cp .env.example .env
+          sed -i "s/^ANALYST_API_KEY=.*/ANALYST_API_KEY=$(openssl rand -hex 24)/" .env
+          sed -i "s/^VIEWER_API_KEY=.*/VIEWER_API_KEY=$(openssl rand -hex 24)/" .env
+          sed -i "s/^INTERNAL_SERVICE_TOKEN=.*/INTERNAL_SERVICE_TOKEN=$(openssl rand -hex 24)/" .env
+      - name: Check the compose file
+        run: docker compose config --quiet
+      - name: Build and start the platform
+        run: docker compose up -d --build
+      - name: Run the end-to-end check
+        run: python scripts/e2e_check.py --output evidence/ci_e2e_report.md
+      - name: Show container status and logs
+        if: always()
+        run: |
+          docker compose ps -a
+          docker compose logs --no-color > compose-logs.txt
+          tail -n 200 compose-logs.txt
+      - name: Keep the evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: end-to-end-evidence
+          path: |
+            evidence/ci_e2e_report.md
+            compose-logs.txt
+      - name: Scan the built images (report only)
+        if: always()
+        run: |
+          for name in gateway agent; do
+            image="secops-$name:1.0.0"
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.74.0 \
+              image --quiet --severity HIGH,CRITICAL --ignore-unfixed --exit-code 0 --format table "$image" \
+              > "scan-$name.txt" || echo "scan could not run for $image" > "scan-$name.txt"
+            cat "scan-$name.txt"
+            {
+              echo "## Vulnerability scan: $image"
+              echo '```'
+              tail -n 40 "scan-$name.txt"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Stop the platform
+        if: always()
+        run: docker compose down -v

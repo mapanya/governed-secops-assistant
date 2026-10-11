@@ -1,0 +1,18 @@
+# Packages for running the unit tests on a laptop or workstation, without Docker.
+# Install inside a virtual environment with:
+#   python3 -m pip install -r requirements-dev.txt
+# Then run the tests from the project folder with:
+#   python3 -m pytest -v
+#
+# The database client and the embedding model library are not needed here:
+# the tests replace them with small stand-ins.
+fastapi==0.143.0
+uvicorn==0.54.0
+httpx==0.28.1
+pydantic==2.14.0
+langgraph==1.2.14
+pypdf==6.20.0
+opentelemetry-api==1.45.1
+opentelemetry-sdk==1.45.1
+opentelemetry-exporter-otlp-proto-http==1.45.1
+pytest==9.1.1

@@ -1,0 +1,29 @@
+# syntax=docker/dockerfile:1
+#
+# Gateway image (layers 1 and 2), built in two stages:
+#   1. "build" installs the locked packages and checks every fingerprint.
+#   2. The final image copies in only the installed packages and the code
+#      and runs as an ordinary user, never as the administrator (root).
+# The base image is pinned by its digest so every build starts from the
+# same bytes. Dependabot proposes digest updates (see .github/dependabot.yml).
+
+FROM python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1 AS build
+ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+WORKDIR /build
+COPY requirements.txt .
+RUN pip install --require-hashes --prefix=/install -r requirements.txt
+
+FROM python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+RUN useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin appuser
+WORKDIR /app
+COPY --from=build /install /usr/local
+COPY __init__.py main.py security.py guardrails.py telemetry.py /app/gateway/
+COPY static /app/gateway/static
+# Copied files keep the permissions they had on the machine that built the
+# image. Make the code readable by the app user whatever they were; the
+# app user still cannot change it.
+RUN chmod -R a+rX /app
+USER 10001
+EXPOSE 8000
+CMD ["uvicorn", "gateway.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000", "--no-server-header"]

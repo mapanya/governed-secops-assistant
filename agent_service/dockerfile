@@ -1,0 +1,33 @@
+# syntax=docker/dockerfile:1
+#
+# Agent service image (layers 3 and 4). The same image also runs the one-off
+# ingest job that loads the documents into Weaviate.
+#   1. "build" installs the locked packages (every fingerprint checked) and
+#      downloads the all-MiniLM-L6-v2 embedding model once, into /models.
+#   2. The final image copies in the packages, the model and the code, runs
+#      as an ordinary user and switches the model library to offline mode,
+#      so nothing is downloaded at run time (the data network has no internet).
+
+FROM python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1 AS build
+ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+WORKDIR /build
+COPY requirements.txt .
+RUN pip install --require-hashes --prefix=/install -r requirements.txt
+ENV PYTHONPATH=/install/lib/python3.12/site-packages
+RUN python -c "from fastembed import TextEmbedding; TextEmbedding('sentence-transformers/all-MiniLM-L6-v2', cache_dir='/models')"
+
+FROM python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 MODEL_CACHE_DIR=/models HF_HUB_OFFLINE=1
+RUN useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin appuser
+WORKDIR /app
+COPY --from=build /install /usr/local
+COPY --from=build --chown=10001:10001 /models /models
+COPY __init__.py main.py graph.py vector_store.py llm.py telemetry.py /app/agent_service/
+COPY knowledge /app/agent_service/knowledge
+# Copied files keep the permissions they had on the machine that built the
+# image. Make the code readable by the app user whatever they were; the
+# app user still cannot change it.
+RUN chmod -R a+rX /app
+USER 10001
+EXPOSE 8001
+CMD ["uvicorn", "agent_service.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8001", "--no-server-header"]

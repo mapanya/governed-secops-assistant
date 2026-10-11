@@ -1,0 +1,412 @@
+# The same platform on Kubernetes (Minikube), used for the staged release
+# (canary) and rollback described in docs/sdd.md section 12.
+#
+# One-time setup, from the project folder:
+#   minikube start --memory=6144 --cpus=4
+#       (add --cni=calico if the network policies at the end must be enforced)
+#   docker compose build
+#   minikube image load secops-gateway:1.0.0
+#   minikube image load secops-agent:1.0.0
+#   kubectl create namespace secops
+#   kubectl -n secops create secret generic secops-secrets --from-env-file=.env
+#   kubectl apply -f k8s/minikube.yaml
+#   kubectl -n secops get pods --watch          (wait until every pod is Running and ready)
+#   minikube service -n secops gateway --url    (opens the console address)
+#
+# Staged release with rollback:
+#   kubectl -n secops scale deployment/agent-service-canary --replicas=1
+#   kubectl -n secops set env deployment/gateway CANARY_PERCENT=10     (stage 2: canary)
+#   kubectl -n secops set env deployment/gateway CANARY_PERCENT=50     (stage 3: half)
+#   kubectl -n secops set env deployment/agent-service AGENT_VERSION=1.1.0 TOP_K=5
+#                                                                       (stage 4: rolling update of stable)
+#   kubectl -n secops rollout status deployment/agent-service
+# Roll back at any stage:
+#   kubectl -n secops set env deployment/gateway CANARY_PERCENT=0
+#   kubectl -n secops rollout undo deployment/agent-service
+#   kubectl -n secops scale deployment/agent-service-canary --replicas=0
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: secops
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: secops-config
+  namespace: secops
+data:
+  WEAVIATE_HOST: weaviate
+  PHOENIX_COLLECTOR_ENDPOINT: http://phoenix:6006
+  PHOENIX_PROJECT_NAME: governed-secops-assistant
+  GEMINI_MODEL: gemini-3.5-flash
+  LLM_TIMEOUT_SECONDS: "20"
+  LLM_MAX_ATTEMPTS: "3"
+  MAX_ROUNDS: "3"
+  GROUNDING_THRESHOLD: "0.7"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: weaviate-data
+  namespace: secops
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: phoenix-data
+  namespace: secops
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+# Layer 4: the vector store.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: weaviate
+  namespace: secops
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate   # one copy at a time, because it owns its storage
+  selector:
+    matchLabels: {app: weaviate}
+  template:
+    metadata:
+      labels: {app: weaviate, tier: data}
+    spec:
+      # Kubernetes would otherwise add variables such as PHOENIX_PORT=tcp://...
+      # for every service, which clash with the programs' own settings.
+      enableServiceLinks: false
+      containers:
+        - name: weaviate
+          image: cr.weaviate.io/semitechnologies/weaviate:1.39.11
+          args: ["--host", "0.0.0.0", "--port", "8080", "--scheme", "http"]
+          env:
+            - {name: AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED, value: "true"}
+            - {name: PERSISTENCE_DATA_PATH, value: /var/lib/weaviate}
+            - {name: DEFAULT_VECTORIZER_MODULE, value: none}
+            - {name: CLUSTER_HOSTNAME, value: node1}
+            - {name: DISABLE_TELEMETRY, value: "true"}
+          ports:
+            - {containerPort: 8080, name: http}
+            - {containerPort: 50051, name: grpc}
+          readinessProbe:
+            httpGet: {path: /v1/.well-known/ready, port: 8080}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /v1/.well-known/live, port: 8080}
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {cpu: "1", memory: 1Gi}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/weaviate}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: weaviate-data}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: weaviate
+  namespace: secops
+spec:
+  selector: {app: weaviate}
+  ports:
+    - {name: http, port: 8080, targetPort: 8080}
+    - {name: grpc, port: 50051, targetPort: 50051}
+---
+# Layer 5: traces and evaluations.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: phoenix
+  namespace: secops
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {app: phoenix}
+  template:
+    metadata:
+      labels: {app: phoenix}
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: phoenix
+          image: arizephoenix/phoenix:version-20.19.0
+          env:
+            - {name: PHOENIX_WORKING_DIR, value: /mnt/data}
+            - {name: PHOENIX_PORT, value: "6006"}   # a plain number; see enableServiceLinks above
+          ports:
+            - {containerPort: 6006}
+          readinessProbe:
+            httpGet: {path: /healthz, port: 6006}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {cpu: "1", memory: 1Gi}
+          volumeMounts:
+            - {name: data, mountPath: /mnt/data}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: phoenix-data}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: phoenix
+  namespace: secops
+spec:
+  type: NodePort
+  selector: {app: phoenix}
+  ports:
+    - {port: 6006, targetPort: 6006, nodePort: 30606}
+---
+# One-off job that loads the approved documents into the vector store.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ingest
+  namespace: secops
+spec:
+  backoffLimit: 6   # retries while Weaviate is still starting
+  template:
+    metadata:
+      labels: {app: ingest, access-weaviate: "true"}
+    spec:
+      enableServiceLinks: false
+      restartPolicy: OnFailure
+      securityContext: {runAsNonRoot: true, runAsUser: 10001}
+      containers:
+        - name: ingest
+          image: secops-agent:1.0.0
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "agent_service.vector_store", "ingest"]
+          envFrom:
+            - configMapRef: {name: secops-config}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+---
+# Layer 3: the agent team, stable version.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-service
+  namespace: secops
+spec:
+  replicas: 1
+  revisionHistoryLimit: 5   # keeps earlier versions available for "rollout undo"
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}   # the old copy serves until the new one is ready
+  selector:
+    matchLabels: {app: agent-service, track: stable}
+  template:
+    metadata:
+      labels: {app: agent-service, track: stable, access-weaviate: "true"}
+    spec:
+      enableServiceLinks: false
+      securityContext: {runAsNonRoot: true, runAsUser: 10001}
+      containers:
+        - name: agent
+          image: secops-agent:1.0.0
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef: {name: secops-config}
+            - secretRef: {name: secops-secrets}
+          env:
+            - {name: DEPLOYMENT_TRACK, value: stable}
+            - {name: AGENT_VERSION, value: "1.0.0"}
+          ports:
+            - {containerPort: 8001}
+          readinessProbe:
+            httpGet: {path: /ready, port: 8001}   # ready only after the documents are loaded
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /health, port: 8001}
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {cpu: "1", memory: 1Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-service
+  namespace: secops
+spec:
+  selector: {app: agent-service, track: stable}
+  ports:
+    - {port: 8001, targetPort: 8001}
+---
+# Layer 3: the canary version. Off (0 copies) until a staged release begins.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-service-canary
+  namespace: secops
+spec:
+  replicas: 0
+  selector:
+    matchLabels: {app: agent-service, track: canary}
+  template:
+    metadata:
+      labels: {app: agent-service, track: canary, access-weaviate: "true"}
+    spec:
+      enableServiceLinks: false
+      securityContext: {runAsNonRoot: true, runAsUser: 10001}
+      containers:
+        - name: agent
+          image: secops-agent:1.0.0
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef: {name: secops-config}
+            - secretRef: {name: secops-secrets}
+          env:
+            - {name: DEPLOYMENT_TRACK, value: canary}
+            - {name: AGENT_VERSION, value: 1.1.0-canary}
+            - {name: TOP_K, value: "5"}
+          ports:
+            - {containerPort: 8001}
+          readinessProbe:
+            httpGet: {path: /ready, port: 8001}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {cpu: "1", memory: 1Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-service-canary
+  namespace: secops
+spec:
+  selector: {app: agent-service, track: canary}
+  ports:
+    - {port: 8001, targetPort: 8001}
+---
+# Layers 1 and 2: the gateway and the console.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: secops
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+  selector:
+    matchLabels: {app: gateway}
+  template:
+    metadata:
+      labels: {app: gateway}
+    spec:
+      enableServiceLinks: false
+      securityContext: {runAsNonRoot: true, runAsUser: 10001}
+      containers:
+        - name: gateway
+          image: secops-gateway:1.0.0
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef: {name: secops-config}
+            - secretRef: {name: secops-secrets}
+          env:
+            - {name: AGENT_SERVICE_URL, value: "http://agent-service:8001"}
+            - {name: AGENT_CANARY_URL, value: "http://agent-service-canary:8001"}
+            - {name: CANARY_PERCENT, value: "0"}
+            - {name: PHOENIX_UI_URL, value: "http://localhost:6006"}
+          ports:
+            - {containerPort: 8000}
+          readinessProbe:
+            httpGet: {path: /health, port: 8000}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /health, port: 8000}
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: secops
+spec:
+  type: NodePort
+  selector: {app: gateway}
+  ports:
+    - {port: 8000, targetPort: 8000, nodePort: 30800}
+---
+# Network policies (enforced when Minikube runs with --cni=calico).
+# Only the agent pods and the ingest job may reach Weaviate and Weaviate may
+# reach nothing except the cluster's name service: the "no internet" rule.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: weaviate-isolation
+  namespace: secops
+spec:
+  podSelector:
+    matchLabels: {app: weaviate}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {access-weaviate: "true"}
+  egress:
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels: {k8s-app: kube-dns}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+# Only the gateway may call the agent services.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agents-from-gateway-only
+  namespace: secops
+spec:
+  podSelector:
+    matchLabels: {app: agent-service}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app: gateway}
+      ports:
+        - {protocol: TCP, port: 8001}

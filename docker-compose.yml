@@ -1,0 +1,198 @@
+# The master file: starts the whole platform with one command.
+#
+#   docker compose up -d --build        start everything (first build takes several minutes)
+#   docker compose ps                   see each container and its health
+#   docker compose logs -f gateway      follow one service's log
+#   docker compose down                 stop everything (add -v to delete stored data)
+#
+# Services and the five layers:
+#   gateway         layers 1 and 2: API gateway and guardrails     http://localhost:8000 (GATEWAY_PORT)
+#   agent-service   layer 3: the agent team (internal only)
+#   weaviate        layer 4: the vector store (data network, no internet)
+#   phoenix         layer 5: traces and evaluations                 http://localhost:6006 (PHOENIX_PORT)
+#   ingest          one-off job that loads the documents, then exits
+#   agent-service-canary   optional new version for staged release (profile "canary")
+#
+# Start order, enforced with health checks:
+#   weaviate (healthy) -> ingest (finished) -> agent-service (healthy) -> gateway
+#
+# Secrets come from the .env file next to this one (copy .env.example to .env).
+
+name: governed-secops-assistant
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"   # log rotation keeps the disk from filling up
+    max-file: "3"
+
+x-hardening: &hardening
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+x-agent-build: &agent-build
+  context: ./agent_service
+  dockerfile: dockerfile
+
+x-agent-env: &agent-env
+  INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:?Set INTERNAL_SERVICE_TOKEN in .env}
+  GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+  GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash}
+  LLM_TIMEOUT_SECONDS: "20"
+  LLM_MAX_ATTEMPTS: "3"
+  MAX_ROUNDS: "3"
+  GROUNDING_THRESHOLD: "0.7"
+  AGENTS_KILL_SWITCH: ${AGENTS_KILL_SWITCH:-false}
+  WEAVIATE_HOST: weaviate
+  PHOENIX_COLLECTOR_ENDPOINT: http://phoenix:6006
+  PHOENIX_PROJECT_NAME: governed-secops-assistant
+
+x-agent-health: &agent-health
+  test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=4)"]
+  interval: 10s
+  timeout: 5s
+  retries: 12
+  start_period: 30s
+
+services:
+  weaviate:
+    image: cr.weaviate.io/semitechnologies/weaviate:1.39.11
+    command: ["--host", "0.0.0.0", "--port", "8080", "--scheme", "http"]
+    environment:
+      # Anonymous access is acceptable only because Weaviate sits on the
+      # private data network with no published port and no internet route.
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      PERSISTENCE_DATA_PATH: /var/lib/weaviate
+      DEFAULT_VECTORIZER_MODULE: none
+      CLUSTER_HOSTNAME: node1
+      DISABLE_TELEMETRY: "true"
+      QUERY_DEFAULTS_LIMIT: "25"
+    volumes:
+      - weaviate-data:/var/lib/weaviate
+    networks: [data]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:8080/v1/.well-known/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+    logging: *logging
+
+  phoenix:
+    image: arizephoenix/phoenix:version-20.19.0
+    environment:
+      PHOENIX_WORKING_DIR: /mnt/data
+    ports:
+      - "127.0.0.1:${PHOENIX_PORT:-6006}:6006"   # dashboard, reachable from this machine only
+    volumes:
+      - phoenix-data:/mnt/data
+    networks: [edge]
+    # The image is "distroless": it contains no shell or download tools, so
+    # there is no health check command to run inside it. The services send
+    # traces in the background and simply retry until Phoenix is up.
+    restart: unless-stopped
+    logging: *logging
+
+  ingest:
+    build: *agent-build
+    image: secops-agent:${APP_VERSION:-1.0.0}
+    command: ["python", "-m", "agent_service.vector_store", "ingest"]
+    environment:
+      WEAVIATE_HOST: weaviate
+    networks: [data]
+    depends_on:
+      weaviate:
+        condition: service_healthy
+    restart: "no"
+    <<: *hardening
+    logging: *logging
+
+  agent-service:
+    build: *agent-build
+    image: secops-agent:${APP_VERSION:-1.0.0}
+    environment:
+      <<: *agent-env
+      AGENT_VERSION: ${APP_VERSION:-1.0.0}
+      DEPLOYMENT_TRACK: stable
+    networks: [edge, data]
+    depends_on:
+      weaviate:
+        condition: service_healthy
+      ingest:
+        condition: service_completed_successfully
+      phoenix:
+        condition: service_started
+    healthcheck: *agent-health
+    restart: unless-stopped
+    <<: *hardening
+    logging: *logging
+
+  agent-service-canary:
+    profiles: ["canary"]
+    build: *agent-build
+    image: secops-agent:${APP_VERSION:-1.0.0}
+    environment:
+      <<: *agent-env
+      # The rehearsal canary runs the same code with a new version label and
+      # one changed setting: it reads five passages per search instead of four.
+      AGENT_VERSION: ${CANARY_VERSION:-1.1.0-canary}
+      DEPLOYMENT_TRACK: canary
+      TOP_K: "5"
+    networks: [edge, data]
+    depends_on:
+      weaviate:
+        condition: service_healthy
+      ingest:
+        condition: service_completed_successfully
+    healthcheck: *agent-health
+    restart: unless-stopped
+    <<: *hardening
+    logging: *logging
+
+  gateway:
+    build:
+      context: ./gateway
+      dockerfile: dockerfile
+    image: secops-gateway:${APP_VERSION:-1.0.0}
+    ports:
+      - "127.0.0.1:${GATEWAY_PORT:-8000}:8000"   # console and API, reachable from this machine only
+    environment:
+      ANALYST_API_KEY: ${ANALYST_API_KEY:?Set ANALYST_API_KEY in .env}
+      VIEWER_API_KEY: ${VIEWER_API_KEY:?Set VIEWER_API_KEY in .env}
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:?Set INTERNAL_SERVICE_TOKEN in .env}
+      AGENT_SERVICE_URL: http://agent-service:8001
+      AGENT_CANARY_URL: ${AGENT_CANARY_URL:-}
+      CANARY_PERCENT: ${CANARY_PERCENT:-0}
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-20}
+      PHOENIX_COLLECTOR_ENDPOINT: http://phoenix:6006
+      PHOENIX_UI_URL: http://localhost:${PHOENIX_PORT:-6006}
+      PHOENIX_PROJECT_NAME: governed-secops-assistant
+      APP_VERSION: ${APP_VERSION:-1.0.0}
+    networks: [edge]
+    depends_on:
+      agent-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    read_only: true
+    tmpfs:
+      - /tmp
+    restart: unless-stopped
+    <<: *hardening
+    logging: *logging
+
+networks:
+  edge: {}
+  data:
+    internal: true   # no route to the internet
+
+volumes:
+  weaviate-data:
+  phoenix-data:

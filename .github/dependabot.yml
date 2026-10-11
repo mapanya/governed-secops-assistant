@@ -1,0 +1,17 @@
+# Dependabot opens a pull request when a newer version of a package, base
+# image or workflow action is published, including security fixes. Each pull
+# request runs the full pipeline before anything is merged.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directories: ["/gateway", "/agent_service", "/"]
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directories: ["/gateway", "/agent_service"]
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
