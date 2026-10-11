@@ -59,7 +59,7 @@ jobs:
           tail -n 200 compose-logs.txt
       - name: Keep the evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: end-to-end-evidence
           path: |
